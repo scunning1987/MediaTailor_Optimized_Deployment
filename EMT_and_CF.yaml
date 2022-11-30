@@ -1,0 +1,364 @@
+#### Title : MediaTailor and CloudFront optimized deployment
+#### Author : Scott Cunningham
+####
+####
+## Parameters - User Input
+Parameters:
+  MediaTailorConfigName:
+    Description: Name for the MediaTailor configuration
+    Type: String
+    Default: TestConfig
+  MediaTailorAdsUrl:
+    Description: Ad Decision Server URL
+    Type: String
+    Default: https://n8ljfs0h09.execute-api.us-west-2.amazonaws.com/v1/ads?duration=[session.avail_duration_secs]
+  ContentSourceUrl:
+    Description: Origin URL
+    Type: String
+    Default: https://af93123e0d76e324607b5414578c69b2.p05sqb.channel-assembly.mediatailor.us-west-2.amazonaws.com/v1/
+
+## Resources
+Resources:
+
+  #################
+  ## IAM & Permissions
+  #################
+
+  ## IAM Role
+  MediaTailorLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        |
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Service": "mediatailor.amazonaws.com"
+                    },
+                    "Action": "sts:AssumeRole",
+                    "Condition": {
+                        "StringEquals": {
+                            "sts:ExternalId": "Midas"
+                        }
+                    }
+                }
+            ]
+        }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Tags:
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  ### Custom Resource Lambda Role
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Tags:
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  ### MediaTailor Access Policy
+  LambdaBasicExecutionAndMediaTailorAccess:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref LambdaRole
+      PolicyName: !Sub ${AWS::StackName}-lambdabasicexecution-emtaccess
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+            Resource:
+              - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Effect: Allow
+            Action:
+              - mediatailor:*
+            Resource:
+              - !GetAtt MediaTailorConfiguration.PlaybackConfigurationArn
+
+
+    ###
+    ## MediaTailor
+    ###
+  MediaTailorConfiguration:
+    Type: AWS::MediaTailor::PlaybackConfiguration
+    Properties:
+      Name: !Sub ${MediaTailorConfigName}_${AWS::StackName}
+      AdDecisionServerUrl: !Ref MediaTailorAdsUrl
+      VideoContentSourceUrl: !Ref ContentSourceUrl
+
+    #################
+    ## CloudFront
+    #################
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub Distribution for stack ${AWS::StackName}
+        Enabled: True
+        HttpVersion: http2
+        Origins:
+          - DomainName: !Sub segments.mediatailor.${AWS::Region}.amazonaws.com
+            Id: !Sub MediaTailor_Ads_${AWS::StackName}
+            #Id: 1
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+          - DomainName: !Select [ 2, !Split [ '/' , !GetAtt MediaTailorConfiguration.PlaybackEndpointPrefix ] ]
+            Id: !Sub MediaTailor_SSAI_Endpoints_${AWS::StackName}
+
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+          TargetOriginId: !Sub MediaTailor_Ads_${AWS::StackName}
+
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized # 658327ea-f89d-4fab-a63d-7e88639e58f6
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # Managed-AllViewer # 216adef6-5c7f-47e4-b989-5492eafa07d3
+          ResponseHeadersPolicyId: 5cc3b908-e619-4b99-88e5-2cf7f45965bd # Managed-CORS-With-Preflight # 5cc3b908-e619-4b99-88e5-2cf7f45965bd
+        CacheBehaviors:
+          - PathPattern: '/v1/*'
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - POST
+              - PATCH
+              - DELETE
+            TargetOriginId: !Sub MediaTailor_SSAI_Endpoints_${AWS::StackName}
+
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled # 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # Managed-AllViewer # 216adef6-5c7f-47e4-b989-5492eafa07d3
+            ResponseHeadersPolicyId: 5cc3b908-e619-4b99-88e5-2cf7f45965bd # Managed-CORS-With-Preflight # 5cc3b908-e619-4b99-88e5-2cf7f45965bd
+      Tags:
+        - Key: StackName
+          Value: !Ref AWS::StackName
+    DependsOn:
+      - MediaTailorConfiguration
+
+  #################
+  ## Custom Resource
+  #################
+
+  MediaTailorConfigUpdater:
+    Type: Custom::LambdaInvocationToUpdateEMT
+    Properties:
+      ServiceToken: !GetAtt MediaTailorUpdater.Arn
+      Region: !Ref 'AWS::Region'
+    DependsOn:
+      - LambdaRole
+      - CloudFrontDistribution
+      - MediaTailorConfiguration
+
+  MediaTailorUpdater:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Lambda function to update the MediaTailor configuration
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Timeout: 10
+      MemorySize: 10240
+      Code:
+        ZipFile: |
+          '''
+          Copyright (c) 2022 Scott Cunningham
+
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+          SOFTWARE.
+
+          Summary: This script is a custom resource to place the HTML pages and Lambda code into the destination bucket.
+
+          Original Author: Scott Cunningham
+          '''
+
+          import json
+          import logging
+          import boto3
+          import os
+          import cfnresponse
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+          MANIFESTMODIFY="True"
+
+          version = 2
+
+          def lambda_handler(event, context):
+
+              ## Log the incoming event
+              LOGGER.info("Event : %s " % (event))
+
+              ## Create Response Data Dictionary for the CloudFormation response
+              responseData = dict()
+
+              ## Initialize MediaTailor boto3 client
+              emt = boto3.client('mediatailor')
+
+              # Pull global env variable to variable
+              cloudfront_domain_name = "https://%s" % os.environ['CF_DOMAIN_NAME']
+              emt_config = os.environ['EMT_CONFIG_NAME']
+
+              response = emt.get_playback_configuration(Name=emt_config)
+
+              if event['RequestType'] == "Create" or event['RequestType'] == "Update":
+
+                  # Get config from MediaTailor and write to dictionaries
+                  try:
+
+                      emt_get_config_response = emt.get_playback_configuration(Name=emt_config)
+
+                      # parse response into dictionaries
+                      ad_decision_server_url = emt_get_config_response['AdDecisionServerUrl']
+                      avail_suppression = emt_get_config_response['AvailSuppression']
+                      bumpers = emt_get_config_response['Bumper']
+                      cdn_configuration = emt_get_config_response['CdnConfiguration']
+                      live_preroll = emt_get_config_response['LivePreRollConfiguration']
+                      manifest_rules = emt_get_config_response['ManifestProcessingRules']
+                      config_name = emt_get_config_response['Name']
+                      config_arn = emt_get_config_response['PlaybackConfigurationArn']
+                      config_tags = emt_get_config_response['Tags']
+                      content_src_url = emt_get_config_response['VideoContentSourceUrl']
+
+                      LOGGER.info(emt_get_config_response)
+
+                  except Exception as e:
+                      # error out gracefully
+                      msg = "Unable to get and parse MediaTailor configuration, got exception: %s" % (e)
+                      LOGGER.error(msg)
+                      responseData['Status'] = msg
+                      cfnresponse.send(event, context, "FAILED",responseData)
+                      raise Exception(msg)
+
+                  # Put config update to Mediatailor
+                  try:
+
+                      # add new content prefixess into the cdn_configuration dictionary
+                      cdn_configuration['AdSegmentUrlPrefix'] = cloudfront_domain_name
+                      cdn_configuration['ContentSegmentUrlPrefix'] = cloudfront_domain_name
+
+                      emt_put_config_response = emt.put_playback_configuration(
+                          AdDecisionServerUrl=ad_decision_server_url,
+                          Bumper=bumpers,
+                          CdnConfiguration=cdn_configuration,
+                          LivePreRollConfiguration=live_preroll,
+                          ManifestProcessingRules=manifest_rules,
+                          Name=config_name,
+                          Tags=config_tags,
+                          VideoContentSourceUrl=content_src_url)
+
+                      LOGGER.info(emt_put_config_response)
+
+                  except Exception as e:
+                      # error out gracefully
+                      msg = "Unable to update MediaTailor configuration, got exception: %s" % (e)
+                      LOGGER.error(msg)
+                      responseData['Status'] = msg
+                      cfnresponse.send(event, context, "FAILED",responseData)
+                      raise Exception(msg)
+
+              else:
+
+                  msg = "Stack is deleting, nothing to do on this custom resource"
+                  LOGGER.info(msg)
+                  responseData['Status'] = msg
+                  cfnresponse.send(event, context, "SUCCESS",responseData)
+
+
+              responseData['Status'] = "SUCCESS"
+              cfnresponse.send(event, context, "SUCCESS",responseData)
+              return responseData
+      Environment:
+        Variables:
+          CF_DOMAIN_NAME: !GetAtt CloudFrontDistribution.DomainName
+          EMT_CONFIG_NAME: !Sub ${MediaTailorConfigName}_${AWS::StackName}
+      Tags:
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+
+#################################
+# Outputs
+#################################
+
+Outputs:
+  CloudFrontDomainName:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  SessionInitPrefix:
+    Description: Session Initialization Prefix
+    #Value: !GetAtt MediaTailorConfiguration.SessionInitializationEndpointPrefix
+    Value: !Join
+      - '/'
+      - - 'https:/'
+        - !GetAtt CloudFrontDistribution.DomainName
+        - !Select [ 3, !Split [ '/' , !GetAtt MediaTailorConfiguration.SessionInitializationEndpointPrefix ] ]
+        - !Select [ 4, !Split [ '/' , !GetAtt MediaTailorConfiguration.SessionInitializationEndpointPrefix ] ]
+        - !Select [ 5, !Split [ '/' , !GetAtt MediaTailorConfiguration.SessionInitializationEndpointPrefix ] ]
+        - !Select [ 6, !Split [ '/' , !GetAtt MediaTailorConfiguration.SessionInitializationEndpointPrefix ] ]
+        - ''
+
+
+
+  HLSPrefix:
+    Description: HLS Playback Prefix
+    #Value: !GetAtt MediaTailorConfiguration.HlsConfiguration.ManifestEndpointPrefix
+    Value: !Join
+      - '/'
+      - - 'https:/'
+        - !GetAtt CloudFrontDistribution.DomainName
+        - !Select [ 3, !Split [ '/' , !GetAtt MediaTailorConfiguration.HlsConfiguration.ManifestEndpointPrefix ] ]
+        - !Select [ 4, !Split [ '/' , !GetAtt MediaTailorConfiguration.HlsConfiguration.ManifestEndpointPrefix ] ]
+        - !Select [ 5, !Split [ '/' , !GetAtt MediaTailorConfiguration.HlsConfiguration.ManifestEndpointPrefix ] ]
+        - !Select [ 6, !Split [ '/' , !GetAtt MediaTailorConfiguration.HlsConfiguration.ManifestEndpointPrefix ] ]
+        - ''
+
+  DASHPrefix:
+    Description: DASH Playback Prefix
+    #Value: !GetAtt MediaTailorConfiguration.DashConfiguration.ManifestEndpointPrefix
+    Value: !Join
+      - '/'
+      - - 'https:/'
+        - !GetAtt CloudFrontDistribution.DomainName
+        - !Select [ 3, !Split [ '/' , !GetAtt MediaTailorConfiguration.DashConfiguration.ManifestEndpointPrefix ] ]
+        - !Select [ 4, !Split [ '/' , !GetAtt MediaTailorConfiguration.DashConfiguration.ManifestEndpointPrefix ] ]
+        - !Select [ 5, !Split [ '/' , !GetAtt MediaTailorConfiguration.DashConfiguration.ManifestEndpointPrefix ] ]
+        - !Select [ 6, !Split [ '/' , !GetAtt MediaTailorConfiguration.DashConfiguration.ManifestEndpointPrefix ] ]
+        - ''

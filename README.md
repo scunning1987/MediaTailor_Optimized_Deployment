@@ -1,0 +1,2 @@
+# MediaTailor Optimized Deployment - CloudFormation
+
